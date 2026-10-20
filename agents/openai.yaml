@@ -1,0 +1,9 @@
+interface:
+  display_name: "R2 Wealth Management"
+  short_description: "R2 bank wealth-management workflow and review"
+  brand_color: "#0F766E"
+  default_prompt: "Use $r2-wealth-management to build a fully invested R2 bank wealth-management plan with a 3%+ annualized target when feasible, including screening, position sizing, buy and redeem checklists, term ladders, and monthly review."
+policy:
+  allow_implicit_invocation: true
+dependencies:
+  tools: []
