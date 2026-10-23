@@ -2,7 +2,7 @@
 name: r2-wealth-management
 description: "Operate a fully invested R2 bank wealth-management workflow with a 3%+ annualized target when feasible: screen, size, buy quota-limited issues, redeem or switch, ladder terms, and review. Use for Chinese bank R2/PR2, 招行/招银理财 quota timing, and cash-management plans. Not for stocks, funds, or guaranteed returns."
 metadata:
-  version: "1.4.0"
+  version: "1.4.1"
   short-description: R2 bank wealth-management operating system
 ---
 
@@ -16,6 +16,7 @@ Turn the public "R2 + quota timing + daily P&L" playbook into a repeatable opera
 - Treat annualized 3%+ as the default stretch target, not a promise. Check feasibility against the current R2 pool; if 3% requires leverage or risk outside the user's limits, say so and show the gap.
 - Run a fully invested R2 sleeve by default when the user confirms emergency cash is held outside. No idle cash: default cash reserve is 0 and the liquidity bucket is 0%; the short bucket is the liquidity source. If the user wants a T+0/T+1 parking product, use `--cash-pct` for a small R2 cash-management sleeve.
 - No leverage, no borrowing, and no credit-card or consumer-loan funding. No all-in position in one product.
+- Keep issuer name, amount and share as display/identification metadata. Issuer share is not a screening, allocation, purchase, holding, proposal or automated-evaluation constraint.
 - A quota opening is not a buy signal. Buy only if the product still passes the screen and fits the bucket.
 - Prefer issuer documents over social-media posts. Record the data date and source for every material number.
 - The user makes the final buy and sell decision. Present tradeoffs and checklists; never promise a return.
@@ -79,7 +80,7 @@ Fully invested models:
 | Ladder | 0% | 35% | 35% | 30% |
 | 3% target | 0% | 30% | 35% | 35% |
 
-When the liquidity sleeve is 0%, keep at least 30% in short 7–30 day or T+1 redeemable products. Never put more than 25–30% in one product. For a multi-bank mandate, keep each issuer at 40–50%; for a single-bank mandate such as CMB-only, the issuer cap can be 100%, but cap product series/underlying strategy and keep the single-product limit. If the emergency reserve is not outside the plan, stop and fix that before investing. `--cash-pct 0.10` moves 10% into an R2 cash-management product and scales the other three buckets down proportionally.
+When the liquidity sleeve is 0%, keep at least 30% in short 7–30 day or T+1 redeemable products. Never put more than 25–30% in one product. Cap product series/underlying strategy at 50% and keep the term-bucket rules; issuer share may be reported but does not create a numeric cap. If the emergency reserve is not outside the plan, stop and fix that before investing. `--cash-pct 0.10` moves 10% into an R2 cash-management product and scales the other three buckets down proportionally.
 
 For a 3%+ target, start with `--profile target3`, `yield`, or `barbell` only if the horizon and drawdown budget allow it. Longer duration or credit-selected R2 may raise the yield ceiling, but it also raises volatility and lock-up risk. If the current long R2 products are still below 3%, do not pretend the model reaches the target.
 
@@ -129,7 +130,7 @@ For every confirmed lot:
    - post-fee, post-idle gain ≥ max(10 CNY, 0.10% of remaining principal);
    - candidate yield > break-even yield + 0.05pp;
    - the candidate term is not materially shorter than the comparison horizon;
-   - risk, liquidity and concentration do not worsen.
+   - risk and liquidity do not worsen, and single-product/term-bucket concentration does not increase; issuer share is display-only and is not a pass/fail condition.
    If the economics pass but quota or redemption rules are unverified, keep the label but add "执行前核对" and do not treat it as an executable order. If only some conditions pass, use **观察**; otherwise **继续持有**.
 7. **Gate the label on actual redeemability.** A fixed-term or holding-period lot that is still inside its lock-up cannot be switched now, even if the candidate economics look better. In that case the holding verdict must be **继续持有（锁定期）**, the candidate may be shown as **到期后可替换**, and the decision log entry must use action `观察` with `planned_action=replace_at_maturity`; do not write a `切换` action or imply an executable redemption. Only after the maturity/open date, or for a daily-open product with verified redemption, can the label become **建议替换** and action become `切换`.
 8. **Record the decision before acting.** Write the replacement decision to the decision log with action `切换` (or `赎回`) only when redeemable now; otherwise use `观察` for the maturity plan. Include evidence date, verification date, the current and candidate codes, snapshot date, comparison horizon, idle days, fee drag, break-even yield, expected difference, and the explicit reason. A decision without an evidence date and a later verification date is incomplete.
@@ -139,7 +140,7 @@ Output for each lot: current product and remaining principal, remaining term / c
 
 ### 7. Review
 
-Use [review templates](references/review.md) and `scripts/review.py`. Review daily in one minute, monthly in ten minutes, and quarterly in thirty minutes. Track return, annualized return, target gap, negative-day ratio, maximum drawdown, idle-cash drag (normally 0 in fully invested mode), fee drag, quota hit rate, concentration, and whether the process was followed. If rolling 3M/6M/1Y annualized stays below 3%, review duration, credit, fees, and whether the target is feasible for the current R2 pool.
+Use [review templates](references/review.md) and `scripts/review.py`. Review daily in one minute, monthly in ten minutes, and quarterly in thirty minutes. Track return, annualized return, target gap, negative-day ratio, maximum drawdown, idle-cash drag (normally 0 in fully invested mode), fee drag, quota hit rate, single-product/term-bucket concentration, and whether the process was followed. Show issuer amount and share as holding facts only. If rolling 3M/6M/1Y annualized stays below 3%, review duration, credit, fees, and whether the target is feasible for the current R2 pool.
 
 ## Data acquisition
 

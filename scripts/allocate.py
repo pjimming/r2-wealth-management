@@ -153,7 +153,6 @@ def allocate(
     target: float | None,
     min_unit: float,
     max_product_pct: float,
-    max_issuer_pct: float,
     products: list[Product],
 ) -> dict[str, Any]:
     if amount <= 0:
@@ -170,8 +169,6 @@ def allocate(
         raise ValueError("--min-unit 必须大于 0")
     if not (0 < max_product_pct <= 1):
         raise ValueError("--max-product-pct 必须在 (0, 1] 内")
-    if not (0 < max_issuer_pct <= 1):
-        raise ValueError("--max-issuer-pct 必须在 (0, 1] 内")
 
     base = PROFILES[profile_name]
     if abs(sum(base.values()) - 1.0) > 1e-9:
@@ -198,15 +195,9 @@ def allocate(
         bucket_targets[residue_bucket] = money(bucket_targets[residue_bucket] + residue)
 
     product_totals: dict[str, float] = {}
-    issuer_totals: dict[str, float] = {}
     allocations: list[dict[str, Any]] = []
     leftover: dict[str, float] = {}
     warnings: list[str] = []
-    if max_issuer_pct > 0.5:
-        warnings.append(
-            "单发行方上限高于 50%，按单一银行委托处理；请用单只 25–30%、"
-            "产品系列/底层策略上限控制集中度。"
-        )
 
     for bucket, bucket_target in bucket_targets.items():
         remaining = money(bucket_target)
@@ -223,8 +214,7 @@ def allocate(
                 break
             product_key = f"{product.name}|{product.code}"
             product_cap = investable * max_product_pct - product_totals.get(product_key, 0.0)
-            issuer_cap = investable * max_issuer_pct - issuer_totals.get(product.issuer, 0.0)
-            caps = [remaining, product_cap, issuer_cap]
+            caps = [remaining, product_cap]
             if product.capacity is not None:
                 caps.append(product.capacity)
             allowable = min(caps)
@@ -248,14 +238,13 @@ def allocate(
                 }
             )
             product_totals[product_key] = product_totals.get(product_key, 0.0) + allocation
-            issuer_totals[product.issuer] = issuer_totals.get(product.issuer, 0.0) + allocation
             remaining = money(remaining - allocation)
 
         if remaining > 0:
             leftover[bucket] = remaining
             warnings.append(
                 f"{BUCKET_LABELS[bucket]} 仍有 {remaining:,.0f} 元未分配；"
-                "可能是产品不足、起购金额或集中度上限导致。"
+                "可能是产品不足、起购金额或单只上限导致。"
             )
 
     allocated_total = money(sum(item["amount"] for item in allocations))
@@ -342,7 +331,6 @@ def allocate(
             "profile_weights": profile,
             "min_unit": min_unit,
             "max_product_pct": max_product_pct,
-            "max_issuer_pct": max_issuer_pct,
             "target_annualized_pct": target,
         },
         "bucket_targets": [
@@ -388,7 +376,7 @@ def render_markdown(result: dict[str, Any]) -> str:
     lines.append(
         f"- 模型：{PROFILE_LABELS.get(assumptions['profile'], assumptions['profile'])}；"
         f"单只上限 {assumptions['max_product_pct']*100:.0f}%；"
-        f"单发行方上限 {assumptions['max_issuer_pct']*100:.0f}%；最小交易单位 {assumptions['min_unit']:,.0f} 元"
+        f"发行方仅展示；最小交易单位 {assumptions['min_unit']:,.0f} 元"
     )
     lines.append("")
     lines.append("## 桶目标")
@@ -481,16 +469,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--target",
         type=float,
         default=3.0,
-        help="目标年化（%），默认 3.0；设为 0 可关闭目标检查",
+        help="目标年化（%%），默认 3.0；设为 0 可关闭目标检查",
     )
     parser.add_argument("--min-unit", type=float, default=1000, help="最小交易单位（元），默认 1000")
-    parser.add_argument("--max-product-pct", type=float, default=0.25, help="单只上限，默认 25%")
-    parser.add_argument(
-        "--max-issuer-pct",
-        type=float,
-        default=1.0,
-        help="单发行方上限，默认 100%%（单一银行委托）；多银行组合建议 0.40-0.50",
-    )
+    parser.add_argument("--max-product-pct", type=float, default=0.25, help="单只上限，默认 25%%")
     parser.add_argument("--pool", type=Path, help="产品池 CSV；不提供则只输出桶目标")
     parser.add_argument("--format", choices=("markdown", "json"), default="markdown")
     return parser
@@ -525,7 +507,6 @@ def main(argv: list[str] | None = None) -> int:
             target=args.target,
             min_unit=args.min_unit,
             max_product_pct=args.max_product_pct,
-            max_issuer_pct=args.max_issuer_pct,
             products=products,
         )
     except ValueError as exc:
