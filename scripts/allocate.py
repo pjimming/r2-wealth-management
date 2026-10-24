@@ -18,6 +18,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from evidence import (
+    EVIDENCE_POLICIES,
+    effective_reference_yield,
+    evidence_tier,
+    number_or_none,
+)
+
 
 PROFILES: dict[str, dict[str, float]] = {
     "conservative": {"cash": 0.0, "short": 0.45, "medium": 0.40, "long": 0.15},
@@ -57,6 +64,8 @@ class Product:
     min_amount: float
     capacity: float | None
     bucket: str
+    evidence_tier: str
+    evidence_label: str
     row_number: int
 
 
@@ -122,6 +131,34 @@ def load_pool(path: Path) -> tuple[list[Product], list[str]]:
                 annualized_yield = float(yield_raw) if yield_raw else None
             except ValueError:
                 annualized_yield = None
+            return_1m = number_or_none(row.get("return_1m_annualized"))
+            return_3m = number_or_none(row.get("return_3m_annualized"))
+            return_6m = number_or_none(row.get("return_6m_annualized"))
+            return_1y = number_or_none(row.get("return_1y_annualized"))
+            reported_reference = number_or_none(row.get("reference_yield_pct"))
+            history_months = number_or_none(row.get("history_months"))
+            tier = evidence_tier(
+                history_months,
+                return_1m,
+                return_3m,
+                return_6m,
+                return_1y,
+                (row.get("evidence_tier") or "").strip(),
+            )
+            policy = EVIDENCE_POLICIES[tier]
+            annualized_yield = effective_reference_yield(
+                return_3m,
+                return_6m,
+                return_1y,
+                reported_reference,
+                annualized_yield,
+            )
+            if not policy["automatic"]:
+                warnings.append(
+                    f"第 {row_number} 行「{name}」属于{policy['label']}，"
+                    "不进入自动金额分配。"
+                )
+                continue
             capacity_raw = row.get("capacity")
             try:
                 capacity = float(capacity_raw) if capacity_raw not in (None, "") else None
@@ -139,6 +176,8 @@ def load_pool(path: Path) -> tuple[list[Product], list[str]]:
                     min_amount=max(0.0, min_amount),
                     capacity=capacity,
                     bucket=bucket_for(term_days, name),
+                    evidence_tier=tier,
+                    evidence_label=policy["label"],
                     row_number=row_number,
                 )
             )
@@ -153,6 +192,7 @@ def allocate(
     target: float | None,
     min_unit: float,
     max_product_pct: float,
+    evidence_caps: dict[str, dict[str, float]],
     products: list[Product],
 ) -> dict[str, Any]:
     if amount <= 0:
@@ -169,6 +209,13 @@ def allocate(
         raise ValueError("--min-unit 必须大于 0")
     if not (0 < max_product_pct <= 1):
         raise ValueError("--max-product-pct 必须在 (0, 1] 内")
+    for tier, caps in evidence_caps.items():
+        if tier not in EVIDENCE_POLICIES:
+            raise ValueError(f"未知证据档位: {tier}")
+        for key in ("single_pct", "aggregate_pct"):
+            value = caps[key]
+            if not (0 < value <= 1):
+                raise ValueError(f"{tier}.{key} 必须在 (0, 1] 内")
 
     base = PROFILES[profile_name]
     if abs(sum(base.values()) - 1.0) > 1e-9:
@@ -195,13 +242,21 @@ def allocate(
         bucket_targets[residue_bucket] = money(bucket_targets[residue_bucket] + residue)
 
     product_totals: dict[str, float] = {}
+    evidence_totals: dict[str, float] = {
+        tier: 0.0 for tier in evidence_caps
+    }
     allocations: list[dict[str, Any]] = []
     leftover: dict[str, float] = {}
     warnings: list[str] = []
 
     for bucket, bucket_target in bucket_targets.items():
         remaining = money(bucket_target)
-        candidates = [p for p in products if p.bucket == bucket]
+        candidates = [
+            p
+            for p in products
+            if p.bucket == bucket
+            and EVIDENCE_POLICIES.get(p.evidence_tier, {}).get("automatic", False)
+        ]
         candidates.sort(key=lambda p: (-p.score, p.term_days, p.min_amount, p.name))
         if not candidates:
             leftover[bucket] = remaining
@@ -213,8 +268,23 @@ def allocate(
             if remaining <= 0:
                 break
             product_key = f"{product.name}|{product.code}"
-            product_cap = investable * max_product_pct - product_totals.get(product_key, 0.0)
+            tier_caps = evidence_caps.get(product.evidence_tier)
+            effective_single_pct = (
+                min(max_product_pct, tier_caps["single_pct"])
+                if tier_caps
+                else max_product_pct
+            )
+            product_cap = (
+                investable * effective_single_pct
+                - product_totals.get(product_key, 0.0)
+            )
             caps = [remaining, product_cap]
+            if tier_caps:
+                tier_cap = (
+                    investable * tier_caps["aggregate_pct"]
+                    - evidence_totals[product.evidence_tier]
+                )
+                caps.append(tier_cap)
             if product.capacity is not None:
                 caps.append(product.capacity)
             allowable = min(caps)
@@ -235,9 +305,18 @@ def allocate(
                     "amount": money(allocation),
                     "pct_of_investable": money(allocation / investable * 100),
                     "score": product.score,
+                    "evidence_tier": product.evidence_tier,
+                    "evidence_label": product.evidence_label,
+                    "evidence_single_cap_pct": effective_single_pct,
+                    "evidence_aggregate_cap_pct": (
+                        tier_caps["aggregate_pct"] if tier_caps else None
+                    ),
                 }
             )
             product_totals[product_key] = product_totals.get(product_key, 0.0) + allocation
+            evidence_totals[product.evidence_tier] = (
+                evidence_totals.get(product.evidence_tier, 0.0) + allocation
+            )
             remaining = money(remaining - allocation)
 
         if remaining > 0:
@@ -298,10 +377,10 @@ def allocate(
             "covered_amount": covered_amount,
             "allocated_amount": total_amount,
             "coverage_pct": money(covered_amount / total_amount * 100) if total_amount else 0,
-            "note": "加权年化来自产品池 annualized_yield 输入，不是收益承诺。",
+            "note": "加权年化来自可得周期的参考年化，不是收益承诺。",
         }
         if weighted_yield is None:
-            warnings.append("产品池未填 annualized_yield，无法做目标检查。")
+            warnings.append("产品池未填参考年化，无法做目标检查。")
         else:
             if gap_bp < 0:
                 warnings.append(
@@ -331,6 +410,7 @@ def allocate(
             "profile_weights": profile,
             "min_unit": min_unit,
             "max_product_pct": max_product_pct,
+            "evidence_caps": evidence_caps,
             "target_annualized_pct": target,
         },
         "bucket_targets": [
@@ -376,6 +456,7 @@ def render_markdown(result: dict[str, Any]) -> str:
     lines.append(
         f"- 模型：{PROFILE_LABELS.get(assumptions['profile'], assumptions['profile'])}；"
         f"单只上限 {assumptions['max_product_pct']*100:.0f}%；"
+        "缺 1Y/仅 3M 单只 10%、同类合计 20%；"
         f"发行方仅展示；最小交易单位 {assumptions['min_unit']:,.0f} 元"
     )
     lines.append("")
@@ -398,7 +479,7 @@ def render_markdown(result: dict[str, Any]) -> str:
         )
         weighted = target_analysis["weighted_annualized_pct"]
         if weighted is None:
-            lines.append("- 组合输入年化：未计算（产品池缺 annualized_yield）")
+            lines.append("- 组合输入年化：未计算（产品池缺参考年化）")
         else:
             gap = target_analysis["target_gap_bp"]
             lines.append(
@@ -413,12 +494,16 @@ def render_markdown(result: dict[str, Any]) -> str:
     if result["allocations"]:
         lines.append("## 产品分配")
         lines.append("")
-        lines.append("| 桶 | 产品 | 发行方 | 期限 | 金额 | 占可投资 | 评分 |")
-        lines.append("|---|---|---|---:|---:|---:|---:|")
+        lines.append("| 桶 | 产品 | 发行方 | 期限 | 数据档位 | 参考年化 | 金额 | 占可投资 | 评分 |")
+        lines.append("|---|---|---|---:|---|---:|---:|---:|---:|")
         for item in result["allocations"]:
+            reference = item["annualized_yield"]
+            reference_text = f"{reference:.2f}%" if reference is not None else "—"
             lines.append(
                 f"| {item['bucket_label']} | {item['name']} | {item['issuer']} | "
-                f"{item['term_days']:.0f}天 | {item['amount']:,.0f} | "
+                f"{item['term_days']:.0f}天 | {item['evidence_label']} | "
+                f"{reference_text} | "
+                f"{item['amount']:,.0f} | "
                 f"{item['pct_of_investable']:.1f}% | {item['score']:.0f} |"
             )
         lines.append("")
@@ -473,6 +558,30 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--min-unit", type=float, default=1000, help="最小交易单位（元），默认 1000")
     parser.add_argument("--max-product-pct", type=float, default=0.25, help="单只上限，默认 25%%")
+    parser.add_argument(
+        "--six-month-single-pct",
+        type=float,
+        default=0.10,
+        help="缺 1Y 的 6M 档单只上限，默认 0.10",
+    )
+    parser.add_argument(
+        "--six-month-aggregate-pct",
+        type=float,
+        default=0.20,
+        help="缺 1Y 的 6M 档合计上限，默认 0.20",
+    )
+    parser.add_argument(
+        "--three-month-single-pct",
+        type=float,
+        default=0.10,
+        help="仅 3M 档单只上限，默认 0.10",
+    )
+    parser.add_argument(
+        "--three-month-aggregate-pct",
+        type=float,
+        default=0.20,
+        help="仅 3M 档合计上限，默认 0.20",
+    )
     parser.add_argument("--pool", type=Path, help="产品池 CSV；不提供则只输出桶目标")
     parser.add_argument("--format", choices=("markdown", "json"), default="markdown")
     return parser
@@ -507,6 +616,16 @@ def main(argv: list[str] | None = None) -> int:
             target=args.target,
             min_unit=args.min_unit,
             max_product_pct=args.max_product_pct,
+            evidence_caps={
+                "six_month": {
+                    "single_pct": args.six_month_single_pct,
+                    "aggregate_pct": args.six_month_aggregate_pct,
+                },
+                "three_month": {
+                    "single_pct": args.three_month_single_pct,
+                    "aggregate_pct": args.three_month_aggregate_pct,
+                },
+            },
             products=products,
         )
     except ValueError as exc:

@@ -15,6 +15,12 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from evidence import (
+    EVIDENCE_POLICIES,
+    effective_reference_yield,
+    evidence_tier,
+)
+
 
 WEIGHTS = {
     "stability": 30.0,
@@ -127,6 +133,16 @@ def load_rows(path: Path) -> list[dict[str, Any]]:
                     "risk_raw": (row.get("risk_level") or "").strip(),
                     "risk": normalize_risk(row.get("risk_level") or ""),
                     "annualized_yield": parse_number(row.get("annualized_yield")),
+                    "return_1m": parse_number(row.get("return_1m_annualized")),
+                    "return_3m": parse_number(row.get("return_3m_annualized")),
+                    "return_6m": parse_number(row.get("return_6m_annualized")),
+                    "return_1y": parse_number(row.get("return_1y_annualized")),
+                    "reported_reference_yield": parse_number(
+                        row.get("reference_yield_pct")
+                    ),
+                    "declared_evidence_tier": (
+                        row.get("evidence_tier") or ""
+                    ).strip(),
                     "max_drawdown_pct": parse_number(row.get("max_drawdown_pct")),
                     "fee_bps": parse_number(row.get("fee_bps")),
                     "liquidity_days": parse_number(row.get("liquidity_days")),
@@ -152,13 +168,43 @@ def score_rows(
 
     for row in rows:
         reasons: list[str] = []
+        tier = evidence_tier(
+            row["history_months"],
+            row["return_1m"],
+            row["return_3m"],
+            row["return_6m"],
+            row["return_1y"],
+            row["declared_evidence_tier"],
+        )
+        policy = EVIDENCE_POLICIES[tier]
+        yield_used = effective_reference_yield(
+            row["return_3m"],
+            row["return_6m"],
+            row["return_1y"],
+            row["reported_reference_yield"],
+            row["annualized_yield"],
+        )
+        row.update(
+            {
+                "evidence_tier": tier,
+                "evidence_label": policy["label"],
+                "evidence_scoring": policy["scoring"],
+                "evidence_automatic": policy["automatic"],
+                "evidence_single_cap_pct": policy["single_cap_pct"],
+                "evidence_aggregate_cap_pct": policy["aggregate_cap_pct"],
+                "reference_yield_pct": yield_used,
+                "yield_used_pct": yield_used,
+            }
+        )
         if row["risk"] not in {"R2", "PR2"}:
             reasons.append(f"风险等级不是 R2/PR2（{row['risk_raw'] or '空'}）")
         if row["term_days"] is None or row["term_days"] < 0:
             reasons.append("期限缺失或为负")
-        if row["annualized_yield"] is None:
-            reasons.append("年化收益缺失")
-        elif row["annualized_yield"] <= 0:
+        if not policy["scoring"]:
+            reasons.append(f"{policy['label']}不进入自动评分")
+        if yield_used is None:
+            reasons.append("参考年化缺失")
+        elif yield_used <= 0:
             reasons.append("年化收益不为正")
         if row["max_drawdown_pct"] is None:
             reasons.append("最大回撤缺失")
@@ -188,7 +234,7 @@ def score_rows(
     for row in passed:
         row["bucket"] = bucket_for(float(row["term_days"]), row["name"])
 
-    all_yields = [float(row["annualized_yield"]) for row in passed]
+    all_yields = [float(row["yield_used_pct"]) for row in passed]
     if all_yields and max(all_yields) > 5.0:
         warnings.append(
             f"最高年化 {max(all_yields):.2f}% 对 R2 偏高，需核查底层、杠杆、估值口径和是否用了短期冲高数据。"
@@ -206,7 +252,7 @@ def score_rows(
             liquidity = clamp01(1.0 - liquidity_days / 10.0)
 
             # Absolute anchor avoids turning a 5bp difference into a 20-point swing.
-            yield_score = clamp01(float(row["annualized_yield"]) / 4.0)
+            yield_score = clamp01(float(row["yield_used_pct"]) / 4.0)
 
             fee_bps = float(row["fee_bps"])
             fees = clamp01(1.0 - fee_bps / 50.0)
@@ -236,9 +282,17 @@ def score_rows(
             BUCKET_ORDER[row["bucket"]],
             -float(row["total_score"]),
             float(row["term_days"]),
-            float(row["annualized_yield"]),
+            float(row["yield_used_pct"]),
         )
     )
+    short_history = [
+        row for row in passed if row["evidence_tier"] in {"six_month", "three_month"}
+    ]
+    if short_history:
+        warnings.append(
+            f"{len(short_history)} 只产品使用不完整历史评分；自动配置须执行"
+            "单只 10%、同类合计 20% 上限，并明确展示缺失周期。"
+        )
     return passed, excluded, warnings
 
 
@@ -262,12 +316,12 @@ def render_markdown(
     if passed:
         lines.append("## 排名")
         lines.append("")
-        lines.append("| # | 桶 | 产品 | 发行方 | 期限 | 年化 | 最大回撤 | 费率 | 到账 | 额度 | 历史 | 数据日期 | 评分 |")
-        lines.append("|---:|---|---|---|---:|---:|---:|---:|---|---|---:|---|---:|")
+        lines.append("| # | 桶 | 产品 | 发行方 | 期限 | 数据档位 | 参考年化 | 最大回撤 | 费率 | 到账 | 额度 | 历史 | 数据日期 | 评分 |")
+        lines.append("|---:|---|---|---|---:|---|---:|---:|---:|---|---|---:|---|---:|")
         for index, row in enumerate(passed, start=1):
             lines.append(
                 f"| {index} | {BUCKET_LABELS[row['bucket']]} | {row['name']} | {row['issuer']} | {row['term_days']:.0f}天 | "
-                f"{row['annualized_yield']:.2f}% | {row['max_drawdown_pct']:.2f}% | "
+                f"{row['evidence_label']} | {row['yield_used_pct']:.2f}% | {row['max_drawdown_pct']:.2f}% | "
                 f"{row['fee_bps'] or 0:.0f}bp | T+{row['liquidity_days'] or 0:.0f} | "
                 f"{row['quota_access_raw'] or '未知'} | {row['history_months']:.0f}月 | "
                 f"{row.get('data_date') or '—'} | "
@@ -276,7 +330,8 @@ def render_markdown(
         lines.append("")
         lines.append(
             "评分权重：稳定性 30、流动性 25、收益 20、费用 15、执行 10。收益率只占 20 分；"
-            "评分只在同一期限桶内比较，跨桶不是替代关系。"
+            "评分只在同一期限桶内比较。缺 1Y 和仅 3M 档必须披露数据缺口，"
+            "配置时执行单只 10%、同类合计 20% 上限；仅 1M 不进入自动评分。"
         )
     else:
         lines.append("没有产品通过硬性筛选。")
@@ -335,6 +390,7 @@ def main(argv: list[str] | None = None) -> int:
                         "min_history_months": args.min_history,
                         "max_drawdown_pct": args.max_drawdown,
                         "max_liquidity_days": args.max_liquidity,
+                        "evidence_policies": EVIDENCE_POLICIES,
                     },
                     "weights": WEIGHTS,
                     "ranked": passed,

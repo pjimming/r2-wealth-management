@@ -22,6 +22,8 @@ https://github.com/pjimming/r2-wealth-management.git
 
 - 仅处理已确认属于 R2/PR2 的银行理财产品。
 - 按短期、中期、长期期限桶建立全仓配置，可按需启用小额 R2 现金管理仓。
+- 按完整 1Y、缺 1Y 的 6M、仅 3M、仅 1M 和无数据五档管理收益证据；缺周期不按 0 分处理。
+- 当前招行工作区对 6M 与 3M 自动候选分别执行单只 10%、同类合计 20% 上限；仅 1M 只作人工新品观察。
 - 在买入前核对风险等级、期限、赎回规则、费用、起购金额和额度状态。
 - 对已确认持仓执行同期限候选比较，并计入赎回费、申购费和切换等待期。
 - 跟踪目标差距、负收益天数、最大回撤、额度和流程执行情况。
@@ -60,17 +62,19 @@ python -B "$skill\scripts\review.py" --input "$skill\assets\daily_log_template.c
 ```
 
 脚本只使用 Python 标准库。运行时使用 `-B`，避免在工作树中生成 `__pycache__`。
+若系统 `python` 不在 PATH，Codex 桌面端可通过 `load_workspace_dependencies` 获取捆绑 Python 的绝对路径后执行。
 
 ## 主要脚本
 
 | 脚本 | 用途 |
 | --- | --- |
 | `scripts/score_products.py` | 对产品池执行硬筛选和加权评分 |
-| `scripts/allocate.py` | 按期限桶和目标生成产品金额，检查单只上限、额度与起购金额 |
+| `scripts/evidence.py` | 统一证据档位、参考年化与短历史仓位政策 |
+| `scripts/allocate.py` | 按期限桶和目标生成产品金额，检查单只/证据档合计上限、额度与起购金额 |
 | `scripts/switch_calc.py` | 计算切换费用、等待期和盈亏平衡年化 |
 | `scripts/review.py` | 计算收益、年化、回撤、目标差距和月度评级 |
 
-发行方字段可以进入输入、分配输出和展示报告，但 `allocate.py` 不再提供发行方比例上限参数。
+产品池模板包含 1M/3M/6M/1Y、参考年化和证据档字段；只有 `annualized_yield` 的旧 CSV 仍可读取，但会标为旧格式。发行方字段可以进入输入、分配输出和展示报告，但 `allocate.py` 不再提供发行方比例上限参数。
 
 ## 修改与验证
 

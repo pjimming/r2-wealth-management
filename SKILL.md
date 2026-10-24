@@ -2,7 +2,7 @@
 name: r2-wealth-management
 description: "Operate a fully invested R2 bank wealth-management workflow with a 3%+ annualized target when feasible: screen, size, buy quota-limited issues, redeem or switch, ladder terms, and review. Use for Chinese bank R2/PR2, 招行/招银理财 quota timing, and cash-management plans. Not for stocks, funds, or guaranteed returns."
 metadata:
-  version: "1.4.1"
+  version: "1.5.0"
   short-description: R2 bank wealth-management operating system
 ---
 
@@ -58,7 +58,15 @@ Then score with the [scorecard](references/product-screening.md#评分卡). Defa
 
 Before allocating, run a target feasibility check with [the 3% target guide](references/return-target.md): compare the best available R2 products' recent 3M/6M/1Y annualized returns and benchmark-implied yields with 3%. If the pool cannot support 3% within the user's drawdown and liquidity limits, mark the gap and do not fill it with leverage, fake yield, or unsuitable products.
 
-Check 3M/6M/1Y together. A 1Y figure above the product's benchmark range can be historical, not forward; do not select it on 1Y alone.
+Use available evidence instead of requiring a complete 1Y record:
+
+- `full_1y`: 3M/6M/1Y complete; use the normal comparison and concentration limits.
+- `six_month`: 3M and 6M available, 1Y missing; renormalise the reference yield over 3M/6M and never treat missing 1Y as zero.
+- `three_month`: only 3M is usable for ranking; treat it as lower-confidence evidence.
+- `one_month`: only 1M is available; keep it in a separate new-product observation list and do not create an automatic allocation.
+- `no_data`: display only; do not infer yield.
+
+For the current CMB workspace, `six_month` and `three_month` automatic candidates are each capped at 10% per product and 20% in aggregate for that evidence tier. Only 1M products require manual review and never receive an automatic target. A 1Y figure above the product's benchmark range can be historical, not forward; do not select it on 1Y alone.
 
 ### 3. Allocate by term bucket
 
@@ -84,7 +92,7 @@ When the liquidity sleeve is 0%, keep at least 30% in short 7–30 day or T+1 re
 
 For a 3%+ target, start with `--profile target3`, `yield`, or `barbell` only if the horizon and drawdown budget allow it. Longer duration or credit-selected R2 may raise the yield ceiling, but it also raises volatility and lock-up risk. If the current long R2 products are still below 3%, do not pretend the model reaches the target.
 
-As of 2026-10-19, the CMB ordinary candidate pool has 432 products (17 daily-open, 159 short, 93 medium, 163 long); its 1Y median is about 1.73%. A constrained target3 backtest can show a 1Y historical input around 2.9%, while 3M/6M run-rate is around 2.5%/1.9%. Report the 1Y and 3M/6M figures separately, and never turn the 1Y figure into a 3% forward return. See [CMB automation](references/cmb-automation.md) for the current snapshot and dynamic-allocation rules.
+Pool counts, medians, snapshot dates and current run-rates are time-sensitive. Read them from the current CSV or API instead of relying on a fixed figure in this skill. Report 1Y history and 3M/6M run-rates separately, and never turn the 1Y figure into a 3% forward return. See [CMB automation](references/cmb-automation.md) for snapshot mechanics and dynamic-allocation rules.
 
 ### 4. Execute the buy
 
@@ -121,7 +129,7 @@ Run this review at least monthly, and whenever a holding enters its maturity or 
 For every confirmed lot:
 
 1. **Match the current lot to the latest snapshot.** Use the product code, not the display name. Record the snapshot date. If the current product is missing from the snapshot, mark current yield and current rules as unavailable; do not substitute a similar product.
-2. **Build a like-for-like candidate set.** Same R2/PR2 risk level, same term bucket, term close to the lot's remaining horizon, purchase minimum not above the remaining principal, and no private/closed product. Show no more than six candidates.
+2. **Build a like-for-like candidate set.** Same R2/PR2 risk level, same term bucket, term close to the lot's remaining horizon, purchase minimum not above the remaining principal, and no private/closed product. Show no more than six candidates. In the current CMB workspace, a 6M or 3M evidence-limited replacement must also fit the 10% single-product limit; if the lot exceeds it, the verdict remains **观察** rather than an executable replacement.
 3. **Compare reference yield, not the 1Y headline.** Use `0.5 × 3M + 0.3 × 6M + 0.2 × 1Y` annualized, renormalised when a field is missing. Always show 3M/6M/1Y separately and the data date. A 1Y figure above the benchmark range is history, not a forward return.
 4. **Use the same-horizon comparison.** For a fixed-term lot, use the remaining days to maturity. For a daily-open lot, use an explicit comparison horizon (default 30 days). If a candidate's term is shorter than the lot's remaining horizon, compare only over the candidate term and flag that reinvestment after it matures is uncertain; such a candidate cannot be a clean "replace". If the candidate term is longer, compare over the candidate term on the same horizon and disclose the extra lock-up.
 5. **Charge the switch path properly.** Record redemption confirmation T+N, arrival T+N, redemption fee, purchase fee and expected idle days. Default idle days = redemption T+N + arrival T+N + 1 (buy confirmation) only when both T+N values are verified; otherwise use an explicit estimate and mark it unverified. Run `scripts/switch_calc.py` or the app's equivalent `r2-holding-review-v1` calculation; do not hand-wave the break-even.
@@ -151,7 +159,7 @@ The skill does not log into the user's account or place orders. For CMB, use [da
 When the user asks for a plan, return:
 
 1. assumptions and constraints, including whether the plan is fully invested or includes an R2 liquidity sleeve, where the emergency reserve sits, and whether 3%+ is a stretch or a hard requirement;
-2. a product shortlist with pass/fail reasons;
+2. a product shortlist with pass/fail reasons, evidence tier, available periods, reference yield and applicable short-history caps;
 3. a bucket allocation table with amounts and percentages;
 4. the target math: required monthly return, current weighted annualized input, 1Y historical input and 3M/6M run-rate separately, target gap, and feasibility;
 5. a buy checklist with dates, cutoffs, and fallbacks;
@@ -166,14 +174,15 @@ When the user asks whether to keep or replace an existing holding, return a hold
 1. the lot and remaining principal, snapshot date, and whether the current product is still in the pool;
 2. remaining term or daily-open comparison horizon, current reference yield and 3M/6M/1Y;
 3. verified redemption path (T+N, fees, idle days) or the exact data gaps;
-4. like-for-like candidates with 3M/6M/1Y, fee, quota status, break-even and post-fee difference;
+4. like-for-like candidates with evidence tier, 3M/6M/1Y, reference yield, applicable cap, fee, quota status, break-even and post-fee difference;
 5. one of **继续持有 / 观察 / 建议替换**, with the threshold arithmetic shown;
 6. the decision-log entry fields (evidence date, verification date, reason) and the next reminder date.
 
 ## Tools
 
-- `scripts/allocate.py` — fully invested R2 bucket and product allocation; optional R2 liquidity sleeve via `--cash-pct`; target check via `--target`.
-- `scripts/score_products.py` — hard filters and weighted ranking from a CSV.
+- `scripts/allocate.py` — fully invested R2 bucket and product allocation; optional R2 liquidity sleeve via `--cash-pct`; target check via `--target`; evidence-tier single and aggregate caps.
+- `scripts/score_products.py` — hard filters and weighted ranking from a CSV; computes reference yield from available 3M/6M/1Y periods and separates 1M-only observations.
+- `scripts/evidence.py` — shared evidence-tier classification, reference-yield and concentration policy.
 - `scripts/switch_calc.py` — break-even yield for a switch after fees and idle days.
 - `scripts/review.py` — monthly metrics, target gap, and grading from a daily CSV.
 - `assets/product_pool_template.csv` — product-pool schema and sample rows.
@@ -181,9 +190,11 @@ When the user asks whether to keep or replace an existing holding, return a hold
 - `assets/monthly_review_template.md` — monthly review worksheet.
 - `assets/product_memo_template.md` — one-page single-product memo.
 
-Run scripts with the environment's Python. They use only the standard library and need Python 3.9+. Treat outputs as calculations, not recommendations.
+Run scripts with the environment's Python. They use only the standard library and need Python 3.10+. In Codex desktop, `load_workspace_dependencies` exposes the bundled Python path when `python` is not on PATH. Treat outputs as calculations, not recommendations.
 
 `allocate.py` reads the pool's `score` column. Run `score_products.py` first and copy each `total_score` into that column, or enter your own 0–100 score. Missing scores default to 50.
+
+The product-pool CSV may carry `return_1m_annualized`, `return_3m_annualized`, `return_6m_annualized`, `return_1y_annualized`, `reference_yield_pct` and `evidence_tier`. When these columns are present, the tools derive the evidence tier and use the normalized reference yield. Legacy CSVs with only `annualized_yield` remain readable, but the output is labelled as legacy and cannot claim the newer evidence-tier guarantees.
 
 Example invocations:
 
