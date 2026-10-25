@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Compare holding an R2 product with switching to another one.
 
-Simple-interest approximation after fees and idle days. The current product is
+Compound-return calculation after fees and idle days. The current product is
 assumed to be held to its maturity/open date; the early-redemption fee applies
 only to the switch path. It does not forecast returns or verify either product.
 """
@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 from typing import Any
 
@@ -27,24 +28,40 @@ def calculate(
     new_yield_pct: float,
     purchase_fee_bps: float,
 ) -> dict[str, Any]:
-    if amount <= 0:
+    if not math.isfinite(amount) or amount <= 0:
         raise ValueError("--amount 必须大于 0")
-    if remaining_days < 0:
+    if not math.isfinite(remaining_days) or remaining_days < 0:
         raise ValueError("--remaining-days 不能为负")
-    if idle_days < 0:
+    if not math.isfinite(idle_days) or idle_days < 0:
         raise ValueError("--idle-days 不能为负")
-    if redemption_fee_bps < 0 or purchase_fee_bps < 0:
+    if (
+        not math.isfinite(redemption_fee_bps)
+        or not math.isfinite(purchase_fee_bps)
+        or redemption_fee_bps < 0
+        or purchase_fee_bps < 0
+    ):
         raise ValueError("费率不能为负")
+    if (
+        not math.isfinite(current_yield_pct)
+        or not math.isfinite(new_yield_pct)
+        or current_yield_pct <= -100
+        or new_yield_pct <= -100
+    ):
+        raise ValueError("参考年化必须大于 -100%")
 
     current_yield = current_yield_pct / 100.0
     new_yield = new_yield_pct / 100.0
     new_days = max(0.0, remaining_days - idle_days)
 
-    current_gross = amount * current_yield * remaining_days / 365.0
+    current_gross = amount * (
+        (1.0 + current_yield) ** (remaining_days / 365.0) - 1.0
+    )
     redemption_fee = amount * redemption_fee_bps / 10_000.0
     current_net = current_gross
 
-    new_gross = amount * new_yield * new_days / 365.0
+    new_gross = amount * (
+        (1.0 + new_yield) ** (new_days / 365.0) - 1.0
+    )
     purchase_fee = amount * purchase_fee_bps / 10_000.0
     # The redemption fee is paid only on the switch path. Holding the current
     # product to its maturity/open date does not trigger an early-redemption fee.
@@ -52,17 +69,23 @@ def calculate(
 
     difference = new_net - current_net
     break_even_yield_pct: float | None
-    if new_days > 0:
+    required_growth = (
+        1.0
+        + (current_net + redemption_fee + purchase_fee) / amount
+        if new_days > 0
+        else None
+    )
+    if required_growth is not None and required_growth > 0:
         break_even_yield_pct = (
-            (current_net + redemption_fee + purchase_fee)
-            * 365.0
-            / (amount * new_days)
-            * 100.0
-        )
+            required_growth ** (365.0 / new_days) - 1.0
+        ) * 100.0
     else:
         break_even_yield_pct = None
 
-    idle_cost = amount * new_yield * idle_days / 365.0
+    idle_cost = amount * (
+        (1.0 + new_yield) ** (remaining_days / 365.0)
+        - (1.0 + new_yield) ** (new_days / 365.0)
+    )
     fee_drag = redemption_fee + purchase_fee
     warnings: list[str] = []
     if new_days <= 0:
@@ -111,9 +134,9 @@ def calculate(
         "verdict": verdict,
         "warnings": warnings,
         "note": (
-            "简单利息近似：费率按初始金额一次性计算，不按扣费后本金二次计息；"
+            "复利计算：费率按初始金额一次性计算，不按扣费后本金二次计息；"
             "假设旧产品继续持有至到期/开放日，不产生提前赎回费，赎回费只在切换路径扣除。"
-            "未计复利、税费、净值波动和产品间风险差异。"
+            "未计税费、净值波动和产品间风险差异。"
         ),
     }
 

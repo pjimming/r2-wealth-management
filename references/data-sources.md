@@ -41,13 +41,16 @@ POST https://finprod.paas.cmbchina.com/api/prod/queryProdList
 
 “刷新快照”不是抓实时数据，而是重新选择本地 CSV：`R2_PRODUCT_CSV` 优先；否则按**文件名日期**选最新的 `data/cmb_r2_universe*.csv`，找不到时回退 `data/cmb_r2_products*.csv`，同日期看修改时间；然后整表替换 `products`。页面上的 `product_snapshot_date` 是产品 `data_date` 的最大值，不等于文件名日期。
 
-应用观察池的排序不是 CSV 的 `score` 列，而是：
+应用观察池的排序不是 CSV 的 `score` 列，而是基于期限调整参考年化。期限桶和权重为：
 
 ```text
-0.45 × 3M + 0.30 × 6M + 0.25 × 1Y
+cash:   1M 70% + 3M 30%（只展示）
+short:  1M 20% + 3M 50% + 6M 30%
+medium: 3M 50% + 6M 30% + 1Y 20%
+long:   3M 20% + 6M 40% + 1Y 40%
 ```
 
-若 `1M < 3M - 0.5` 再扣 0.08。`selection_score` 还会对 `1Y - 6M > 1` 的前视偏差扣分，并对成立满 18/24 个月的产品加分。`cmb_r2_selected` 取短/中/长每桶前 3 只，最多 9 只。
+只在所属桶的可用窗口内重归一化；全部缺失时为 unavailable，不按 0 补齐。若 `1M < 3M - 0.5`，short/medium/long 再扣 0.08。`selection_score` 的前视扣分采用 B 方案：short/medium 阈值 1pp，long 阈值 1.5pp；成立满 18/24 个月分别加 0.015/0.03。`weighted_yield_pct` 是参考年化别名。`cmb_r2_selected` 取 short/medium/long 每桶前 3 只，最多 9 只，cash 不进入。
 
 实际 `watchlist` 不是每桶固定一只：`buildProductView` 会按本金、已确认持仓、待确认买入、期限桶目标、流动性下限、未来 0–3/3–6/6–12 个月现金流、单只/底层策略上限和逐只额度，动态决定产品数量与目标金额。发行方名称和当前持仓占比只展示，不参与筛选或配置限制。
 

@@ -135,26 +135,34 @@ POST https://mobile.cmbchina.com/ientrustfinance/financelist/alllist
 
 所以文件名可以是 2026-10-19，而页面显示“快照 2026-10-18、历史 2026-10-15”，这不代表选错文件。
 
-## 应用研究池与证据分层
+## 应用研究池、期限桶与证据分层
 
-应用不是直接用 CSV 的 `score` 列，而是重新计算：
+应用不是直接用 CSV 的 `score` 列，也不是由 Skill 另算一套收益公式。正式收益策略为 `r2-term-yield-v1`，唯一计算内核是应用的 `lib/yield-policy.js`；Skill 的 `scripts/evidence.py` 必须返回与它相同的现代收益结果。
+
+期限桶：
+
+| 桶 | 期限 | 参考年化窗口和权重 | 用途 |
+|---|---|---|---|
+| `cash` | 恰好 0 天 | 1M 70% + 3M 30% | 只展示 |
+| `short` | 1–30 天 | 1M 20% + 3M 50% + 6M 30% | 评分、候选和配置 |
+| `medium` | 31–100 天 | 3M 50% + 6M 30% + 1Y 20% | 评分、候选和配置 |
+| `long` | 101 天以上 | 3M 20% + 6M 40% + 1Y 40% | 评分、候选和配置 |
+
+缺失窗口只在所属桶的指定窗口内重新归一化；全部指定窗口缺失时返回 `reference_yield_status=unavailable` 和 `reference_yield_reason=no_available_horizons`，数值为 `null`。`unknown_term` 不进入产品池、评分、预算、候选或提案。数值 0 是有效收益。
+
+`reference_yield_pct`、`observation_score` 和 `selection_score` 都保留 4 位小数，采用半值远离 0。评分计算顺序：
 
 ```text
-available_periods = finite values among 3M, 6M, 1Y
-observation_score = (0.45 × 3M + 0.30 × 6M + 0.25 × 1Y) ÷ available_weight
+期限桶参考基础值
+→ 1M 比 3M 低超过 0.5pp 时扣 0.08
+→ B 方案前视扣分
+→ 历史加成
+→ 最终舍入
 ```
 
-缺失周期不按 0 分处理。如果 `1M < 3M - 0.5`，再扣 0.08。`selection_score` 另做两项调整：`1Y - 6M > 1` 时最多扣 0.25；成立满 18/24 个月分别加 0.015/0.03。
+B 方案：short/medium 在 `1Y − 6M > 1pp`、long 在 `>1.5pp` 时，扣 `min(0.25, (gap − threshold) × 0.15)`；成立满 18/24 个月分别加 0.015/0.03。`weighted_yield_pct` 是 `reference_yield_pct` 的完全兼容别名，不是第二套公式。
 
-`reference_yield_pct` 是用于排序和展示的参考年化：
-
-```text
-完整数据：(0.5 × 3M + 0.3 × 6M + 0.2 × 1Y) ÷ 1.0
-缺 1Y：  (0.5 × 3M + 0.3 × 6M) ÷ 0.8
-仅 3M：  3M
-```
-
-原“加权年化”字段只在 3M/6M/1Y 全部存在时计算；任何周期缺失返回空值。缺周期时看 `reference_yield_pct`，不得把两个口径混用。
+应用 API 同时返回 `reference_yield_status`、`reference_yield_reason`、`reference_available_horizons` 和 `reference_normalized_weights`。CSV 可直接携带这些结果，但脚本必须能用原始 1M/3M/6M/1Y 独立复算；现代收益字段存在时，全部指定窗口缺失必须保持 unavailable，不能回退到 `reference_yield_pct` 或 `annualized_yield`。
 
 普通可买硬门槛：
 
@@ -168,19 +176,19 @@ observation_score = (0.45 × 3M + 0.30 × 6M + 0.25 × 1Y) ÷ available_weight
 
 | 档位 | 条件 | 可评分 | 自动配置 | 单只/同类合计上限 |
 |---|---|---:|---:|---|
-| `full_1y` | 3M/6M/1Y 完整 | 是 | 是 | 沿用普通单只/策略上限 |
+| `full_1y` | 3M/6M/1Y 完整；short 桶另使用 1M | 是 | 是 | 沿用普通单只/策略上限 |
 | `six_month` | 3M、6M，缺 1Y | 是 | 是 | 10% / 20% |
 | `three_month` | 仅 3M | 是 | 是 | 10% / 20% |
-| `one_month` | 仅 1M | 否 | 否 | 新品观察 |
+| `one_month` | 仅 1M | 否 | 否 | 新品观察；人工观察 5% / 5% |
 | `no_data` | 无有效周期 | 否 | 否 | 0 |
 
-`one_month` 与 `no_data` 保留在可搜索研究池中，但不能自动获得目标金额。`six_month` 与 `three_month` 的 10%/20% 上限分别按证据档计算；持仓替换候选同样不能绕过单只上限。
+`one_month` 与 `no_data` 保留在可搜索研究池中，但不能自动获得目标金额。`six_month` 与 `three_month` 的 10%/20% 上限分别按证据档计算；持仓替换候选同样不能绕过单只上限。cash 可以展示参考值，但不评分、不排名、不分配，也不进入研究观察池。
 
-期限桶：`<=1` 日开、`<=30` 短、`<=100` 中、`>100` 长。研究观察池从可评分候选的短/中/长各取前 3 只，最多 9 只。
+研究观察池从可评分候选的 short/medium/long 各取前 3 只，最多 9 只。产品评分桶 `short=1–30 天`；流动性规则另行要求优先 7–30 天或 T+1 可赎回产品，不能把两个范围写成同一个概念。
 
 实际配置的 `watchlist` 不是每桶固定一只。`buildProductView` 会按本金、已确认持仓、待确认买入、期限桶目标、流动性下限、未来现金流、单只/底层策略上限、证据档位上限和逐只额度，动态决定产品数量与目标金额；发行方名称与当前持仓占比只展示，不参与限制。`cmb_r2_selected` 不代表最终配置。
 
-## 2026-10-19 历史验证快照
+## 2026-10-19 历史验证快照（旧版期限口径）
 
 以下数量只用于说明旧版快照结构，不代表当前产品池：
 
@@ -191,9 +199,9 @@ observation_score = (0.45 × 3M + 0.30 × 6M + 0.25 × 1Y) ÷ available_weight
 | 桶 | 数量 |
 |---|---:|
 | 日开 | 17 |
-| 短（2–30 天） | 159 |
-| 中（31–100 天） | 93 |
-| 长（>100 天） | 163 |
+| 旧版短（2–30 天） | 159 |
+| 旧版中（31–100 天） | 93 |
+| 旧版长（>100 天） | 163 |
 
 研究观察池代码：`JX040210,JX040213,SY040201,ZX040233,XY040215,111301,GD040320,GD040242,PAPB0105`。短/中/长各 3 只。
 

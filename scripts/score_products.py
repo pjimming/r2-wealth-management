@@ -16,7 +16,11 @@ from pathlib import Path
 from typing import Any
 
 from evidence import (
+    BUCKET_WEIGHTS,
+    DEFAULT_FRONT_LOAD_SCHEME,
     EVIDENCE_POLICIES,
+    POLICY_VERSION,
+    calculate_yield_metrics,
     effective_reference_yield,
     evidence_tier,
 )
@@ -49,22 +53,12 @@ ACCESS_SCORES = {
 
 BUCKET_ORDER = {"cash": 0, "short": 1, "medium": 2, "long": 3}
 BUCKET_LABELS = {
-    "cash": "现金",
-    "short": "短期",
-    "medium": "中期",
-    "long": "长期",
+    "cash": "日开（仅展示）",
+    "short": "短期 1–30 天",
+    "medium": "中期 31–100 天",
+    "long": "长期 101 天+",
+    "unknown": "期限未知",
 }
-
-
-def bucket_for(term_days: float, name: str = "") -> str:
-    text = name.lower()
-    if term_days <= 1 or any(k in text for k in ("现金", "活期", "货币", "朝朝宝")):
-        return "cash"
-    if term_days <= 30:
-        return "short"
-    if term_days <= 100:
-        return "medium"
-    return "long"
 
 
 def parse_number(value: Any) -> float | None:
@@ -118,6 +112,15 @@ def load_rows(path: Path) -> list[dict[str, Any]]:
         missing = required - set(reader.fieldnames)
         if missing:
             raise ValueError(f"CSV 缺少列: {', '.join(sorted(missing))}")
+        return_history_columns = {
+            "return_1m_annualized",
+            "return_3m_annualized",
+            "return_6m_annualized",
+            "return_1y_annualized",
+        }
+        has_return_history_columns = bool(
+            return_history_columns.intersection(reader.fieldnames)
+        )
         rows: list[dict[str, Any]] = []
         for row_number, row in enumerate(reader, start=2):
             name = (row.get("name") or "").strip()
@@ -143,6 +146,7 @@ def load_rows(path: Path) -> list[dict[str, Any]]:
                     "declared_evidence_tier": (
                         row.get("evidence_tier") or ""
                     ).strip(),
+                    "has_return_history_columns": has_return_history_columns,
                     "max_drawdown_pct": parse_number(row.get("max_drawdown_pct")),
                     "fee_bps": parse_number(row.get("fee_bps")),
                     "liquidity_days": parse_number(row.get("liquidity_days")),
@@ -177,35 +181,78 @@ def score_rows(
             row["declared_evidence_tier"],
         )
         policy = EVIDENCE_POLICIES[tier]
-        yield_used = effective_reference_yield(
-            row["return_3m"],
-            row["return_6m"],
-            row["return_1y"],
-            row["reported_reference_yield"],
-            row["annualized_yield"],
+        metrics = calculate_yield_metrics(row)
+        reference_status = metrics["reference_yield_status"]
+        reference_reason = metrics["reference_yield_reason"]
+        yield_used = metrics["reference_yield_pct"]
+        legacy_fallback = (
+            not row["has_return_history_columns"]
+            and tier == "legacy"
         )
+        if legacy_fallback:
+            yield_used = effective_reference_yield(
+                row,
+                reported_reference=row["reported_reference_yield"],
+                fallback_yield=row["annualized_yield"],
+                allow_legacy=True,
+            )
+            reference_status = "legacy" if yield_used is not None else "unavailable"
+            reference_reason = (
+                "legacy_fallback" if yield_used is not None else "no_available_horizons"
+            )
+        scoring_bucket = metrics["bucket"] in {"short", "medium", "long"}
+        scoring_allowed = (
+            policy["scoring"]
+            and scoring_bucket
+            and reference_status in {"available", "legacy"}
+        )
+        automatic_allowed = policy["automatic"] and scoring_allowed
         row.update(
             {
                 "evidence_tier": tier,
                 "evidence_label": policy["label"],
-                "evidence_scoring": policy["scoring"],
-                "evidence_automatic": policy["automatic"],
+                "evidence_scoring": scoring_allowed,
+                "evidence_automatic": automatic_allowed,
                 "evidence_single_cap_pct": policy["single_cap_pct"],
                 "evidence_aggregate_cap_pct": policy["aggregate_cap_pct"],
+                "bucket": metrics["bucket"],
                 "reference_yield_pct": yield_used,
+                "reference_yield_status": reference_status,
+                "reference_yield_reason": reference_reason,
+                "reference_available_horizons": metrics[
+                    "reference_available_horizons"
+                ],
+                "reference_normalized_weights": metrics[
+                    "reference_normalized_weights"
+                ],
+                "weighted_yield_pct": yield_used,
+                "yield_policy_version": POLICY_VERSION,
                 "yield_used_pct": yield_used,
+                "observation_score": metrics["observation_score"],
+                "selection_score": metrics["selection_score"],
+                "app_observation_score": metrics["observation_score"],
+                "app_selection_score": metrics["selection_score"],
+                "divergence_penalty_points": metrics[
+                    "divergence_penalty_points"
+                ],
+                "front_load_penalty_points": metrics[
+                    "front_load_penalty_points"
+                ],
+                "history_bonus_points": metrics["history_bonus_points"],
             }
         )
         if row["risk"] not in {"R2", "PR2"}:
             reasons.append(f"风险等级不是 R2/PR2（{row['risk_raw'] or '空'}）")
-        if row["term_days"] is None or row["term_days"] < 0:
-            reasons.append("期限缺失或为负")
+        if row["bucket"] == "unknown":
+            reasons.append("期限不是非负安全整数，无法分桶")
+        elif row["bucket"] == "cash":
+            reasons.append("日开产品只展示，不评分、不排名、不分配")
         if not policy["scoring"]:
             reasons.append(f"{policy['label']}不进入自动评分")
         if yield_used is None:
-            reasons.append("参考年化缺失")
-        elif yield_used <= 0:
-            reasons.append("年化收益不为正")
+            reasons.append(
+                f"期限调整参考年化不可用（{reference_reason or 'unknown'}）"
+            )
         if row["max_drawdown_pct"] is None:
             reasons.append("最大回撤缺失")
         elif row["max_drawdown_pct"] > max_drawdown:
@@ -230,9 +277,6 @@ def score_rows(
 
     if not passed:
         return passed, excluded, warnings
-
-    for row in passed:
-        row["bucket"] = bucket_for(float(row["term_days"]), row["name"])
 
     all_yields = [float(row["yield_used_pct"]) for row in passed]
     if all_yields and max(all_yields) > 5.0:
@@ -316,12 +360,16 @@ def render_markdown(
     if passed:
         lines.append("## 排名")
         lines.append("")
-        lines.append("| # | 桶 | 产品 | 发行方 | 期限 | 数据档位 | 参考年化 | 最大回撤 | 费率 | 到账 | 额度 | 历史 | 数据日期 | 评分 |")
-        lines.append("|---:|---|---|---|---:|---|---:|---:|---:|---|---|---:|---|---:|")
+        lines.append("| # | 桶 | 产品 | 发行方 | 期限 | 数据档位 | 可用窗口 | 参考年化 | App选择分 | 最大回撤 | 费率 | 到账 | 额度 | 历史 | 数据日期 | 综合分 |")
+        lines.append("|---:|---|---|---|---:|---|---|---:|---:|---:|---:|---|---|---:|---|---:|")
         for index, row in enumerate(passed, start=1):
+            windows = " + ".join(row["reference_available_horizons"]) or "—"
+            selection = row.get("app_selection_score")
+            selection_text = f"{selection:.4f}" if selection is not None else "—"
             lines.append(
                 f"| {index} | {BUCKET_LABELS[row['bucket']]} | {row['name']} | {row['issuer']} | {row['term_days']:.0f}天 | "
-                f"{row['evidence_label']} | {row['yield_used_pct']:.2f}% | {row['max_drawdown_pct']:.2f}% | "
+                f"{row['evidence_label']} | {windows} | {row['yield_used_pct']:.4f}% | {selection_text} | "
+                f"{row['max_drawdown_pct']:.2f}% | "
                 f"{row['fee_bps'] or 0:.0f}bp | T+{row['liquidity_days'] or 0:.0f} | "
                 f"{row['quota_access_raw'] or '未知'} | {row['history_months']:.0f}月 | "
                 f"{row.get('data_date') or '—'} | "
@@ -329,8 +377,8 @@ def render_markdown(
             )
         lines.append("")
         lines.append(
-            "评分权重：稳定性 30、流动性 25、收益 20、费用 15、执行 10。收益率只占 20 分；"
-            "评分只在同一期限桶内比较。缺 1Y 和仅 3M 档必须披露数据缺口，"
+            "综合分权重：稳定性 30、流动性 25、收益 20、费用 15、执行 10。"
+            "App选择分是应用期限收益诊断，不等于综合分。缺 1Y 和仅 3M 档必须披露数据缺口，"
             "配置时执行单只 10%、同类合计 20% 上限；仅 1M 不进入自动评分。"
         )
     else:
@@ -391,8 +439,15 @@ def main(argv: list[str] | None = None) -> int:
                         "max_drawdown_pct": args.max_drawdown,
                         "max_liquidity_days": args.max_liquidity,
                         "evidence_policies": EVIDENCE_POLICIES,
+                        "yield_policy_version": POLICY_VERSION,
+                        "front_load_scheme": DEFAULT_FRONT_LOAD_SCHEME,
+                        "reference_weights": BUCKET_WEIGHTS,
                     },
                     "weights": WEIGHTS,
+                    "score_meaning": {
+                        "total_score": "Skill multi-factor score on a 0-100 scale",
+                        "app_selection_score": "Application term-adjusted yield diagnostic",
+                    },
                     "ranked": passed,
                     "excluded": excluded,
                     "warnings": warnings,

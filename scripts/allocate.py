@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Allocate a fully invested R2 portfolio across short/medium/long buckets.
 
-An optional R2 cash-management sleeve can be added with --cash-pct. A target
-check compares the weighted input yield with --target. The script is
+The current CMB workspace keeps the daily-open target at 0%; cash products are
+display-only and never receive scores or target amounts. A target check compares
+the allocated term-adjusted reference yield with --target. This script is
 deterministic planning arithmetic; it does not recommend a product or verify
 live quotas, yields, or risk levels.
 """
@@ -20,6 +21,9 @@ from typing import Any
 
 from evidence import (
     EVIDENCE_POLICIES,
+    POLICY_VERSION,
+    bucket_for_term,
+    calculate_yield_metrics,
     effective_reference_yield,
     evidence_tier,
     number_or_none,
@@ -27,19 +31,18 @@ from evidence import (
 
 
 PROFILES: dict[str, dict[str, float]] = {
-    "conservative": {"cash": 0.0, "short": 0.45, "medium": 0.40, "long": 0.15},
-    "balanced": {"cash": 0.0, "short": 0.40, "medium": 0.40, "long": 0.20},
-    "yield": {"cash": 0.0, "short": 0.30, "medium": 0.40, "long": 0.30},
-    "barbell": {"cash": 0.0, "short": 0.50, "medium": 0.0, "long": 0.50},
-    "ladder": {"cash": 0.0, "short": 0.35, "medium": 0.35, "long": 0.30},
-    "target3": {"cash": 0.0, "short": 0.30, "medium": 0.35, "long": 0.35},
+    "conservative": {"short": 0.45, "medium": 0.40, "long": 0.15},
+    "balanced": {"short": 0.40, "medium": 0.40, "long": 0.20},
+    "yield": {"short": 0.30, "medium": 0.40, "long": 0.30},
+    "barbell": {"short": 0.50, "medium": 0.0, "long": 0.50},
+    "ladder": {"short": 0.35, "medium": 0.35, "long": 0.30},
+    "target3": {"short": 0.30, "medium": 0.35, "long": 0.35},
 }
 
 BUCKET_LABELS = {
-    "cash": "流动性仓（R2现金管理）",
-    "short": "短期限 7–30天",
-    "medium": "中期限 60–100天",
-    "long": "长期限 120天+",
+    "short": "短期限 1–30天",
+    "medium": "中期限 31–100天",
+    "long": "长期限 101天+",
 }
 
 PROFILE_LABELS = {
@@ -66,6 +69,11 @@ class Product:
     bucket: str
     evidence_tier: str
     evidence_label: str
+    reference_yield_status: str
+    reference_yield_reason: str
+    reference_available_horizons: tuple[str, ...]
+    reference_normalized_weights: dict[str, float]
+    yield_policy_version: str
     row_number: int
 
 
@@ -79,17 +87,6 @@ def floor_unit(value: float, unit: float) -> float:
     return money(math.floor((value + 1e-9) / unit) * unit)
 
 
-def bucket_for(term_days: float, name: str = "") -> str:
-    text = name.lower()
-    if term_days <= 1 or any(k in text for k in ("现金", "活期", "货币", "朝朝宝")):
-        return "cash"
-    if term_days <= 30:
-        return "short"
-    if term_days <= 100:
-        return "medium"
-    return "long"
-
-
 def load_pool(path: Path) -> tuple[list[Product], list[str]]:
     warnings: list[str] = []
     products: list[Product] = []
@@ -97,6 +94,12 @@ def load_pool(path: Path) -> tuple[list[Product], list[str]]:
         reader = csv.DictReader(handle)
         if not reader.fieldnames:
             raise ValueError("产品池 CSV 没有表头")
+        modern_history_columns = {
+            "return_1m_annualized",
+            "return_3m_annualized",
+            "return_6m_annualized",
+            "return_1y_annualized",
+        }.intersection(reader.fieldnames)
         required = {"name", "risk_level", "term_days"}
         missing = required - set(reader.fieldnames)
         if missing:
@@ -110,13 +113,21 @@ def load_pool(path: Path) -> tuple[list[Product], list[str]]:
             if risk not in {"R2", "PR2"}:
                 warnings.append(f"第 {row_number} 行「{name}」风险等级为 {risk or '空'}，已排除。")
                 continue
-            try:
-                term_days = float(row.get("term_days") or 0)
-            except ValueError:
+            term_days = number_or_none(row.get("term_days"))
+            if term_days is None:
                 warnings.append(f"第 {row_number} 行「{name}」term_days 不是数字，已排除。")
                 continue
-            if term_days < 0:
-                warnings.append(f"第 {row_number} 行「{name}」term_days 为负数，已排除。")
+            bucket = bucket_for_term(term_days)
+            if bucket == "unknown":
+                warnings.append(
+                    f"第 {row_number} 行「{name}」term_days 必须是非负整数，已排除。"
+                )
+                continue
+            if bucket == "cash":
+                warnings.append(
+                    f"第 {row_number} 行「{name}」属于日开展示层，"
+                    "当前工作台不评分、不排名、不分配。"
+                )
                 continue
             try:
                 score = float(row.get("score") or 50)
@@ -137,22 +148,51 @@ def load_pool(path: Path) -> tuple[list[Product], list[str]]:
             return_1y = number_or_none(row.get("return_1y_annualized"))
             reported_reference = number_or_none(row.get("reference_yield_pct"))
             history_months = number_or_none(row.get("history_months"))
+            declared_tier = (row.get("evidence_tier") or "").strip()
             tier = evidence_tier(
                 history_months,
                 return_1m,
                 return_3m,
                 return_6m,
                 return_1y,
-                (row.get("evidence_tier") or "").strip(),
+                declared_tier,
             )
             policy = EVIDENCE_POLICIES[tier]
-            annualized_yield = effective_reference_yield(
-                return_3m,
-                return_6m,
-                return_1y,
-                reported_reference,
-                annualized_yield,
+            product_data = {
+                "term_days": term_days,
+                "return_1m": return_1m,
+                "return_3m": return_3m,
+                "return_6m": return_6m,
+                "return_1y": return_1y,
+                "history_months": history_months,
+            }
+            metrics = calculate_yield_metrics(product_data)
+            allow_legacy = (
+                tier == "legacy"
+                and (not modern_history_columns or declared_tier == "legacy")
             )
+            reference_status = metrics["reference_yield_status"]
+            reference_reason = metrics["reference_yield_reason"]
+            if metrics["reference_yield_status"] == "available":
+                annualized_yield = metrics["reference_yield_pct"]
+            elif allow_legacy:
+                annualized_yield = effective_reference_yield(
+                    product_data,
+                    reported_reference=reported_reference,
+                    fallback_yield=annualized_yield,
+                    allow_legacy=True,
+                )
+                if annualized_yield is not None:
+                    reference_status = "legacy"
+                    reference_reason = "legacy_fallback"
+            else:
+                annualized_yield = None
+            if annualized_yield is None:
+                warnings.append(
+                    f"第 {row_number} 行「{name}」期限调整参考年化不可用"
+                    f"（{metrics['reference_yield_reason']}），已排除。"
+                )
+                continue
             if not policy["automatic"]:
                 warnings.append(
                     f"第 {row_number} 行「{name}」属于{policy['label']}，"
@@ -175,9 +215,18 @@ def load_pool(path: Path) -> tuple[list[Product], list[str]]:
                     annualized_yield=annualized_yield,
                     min_amount=max(0.0, min_amount),
                     capacity=capacity,
-                    bucket=bucket_for(term_days, name),
+                    bucket=bucket,
                     evidence_tier=tier,
                     evidence_label=policy["label"],
+                    reference_yield_status=reference_status,
+                    reference_yield_reason=reference_reason,
+                    reference_available_horizons=tuple(
+                        metrics["reference_available_horizons"]
+                    ),
+                    reference_normalized_weights=dict(
+                        metrics["reference_normalized_weights"]
+                    ),
+                    yield_policy_version=POLICY_VERSION,
                     row_number=row_number,
                 )
             )
@@ -188,7 +237,6 @@ def allocate(
     amount: float,
     profile_name: str,
     cash_reserve: float,
-    cash_pct: float,
     target: float | None,
     min_unit: float,
     max_product_pct: float,
@@ -199,8 +247,6 @@ def allocate(
         raise ValueError("--amount 必须大于 0")
     if cash_reserve < 0 or cash_reserve >= amount:
         raise ValueError("--cash-reserve 必须大于等于 0 且小于 --amount")
-    if not (0 <= cash_pct < 1):
-        raise ValueError("--cash-pct 必须在 [0, 1) 内")
     if target is not None and target < 0:
         raise ValueError("--target 不能为负")
     if target is not None and target > 20:
@@ -220,14 +266,7 @@ def allocate(
     base = PROFILES[profile_name]
     if abs(sum(base.values()) - 1.0) > 1e-9:
         raise ValueError(f"模型 {profile_name} 的比例之和不是 100%")
-    non_cash_total = sum(base[b] for b in ("short", "medium", "long"))
-    if non_cash_total <= 0:
-        raise ValueError(f"模型 {profile_name} 没有非现金桶")
-    profile = {
-        b: base[b] / non_cash_total * (1.0 - cash_pct)
-        for b in ("short", "medium", "long")
-    }
-    profile["cash"] = cash_pct
+    profile = dict(base)
 
     investable = money(amount - cash_reserve)
     bucket_targets = {
@@ -307,6 +346,15 @@ def allocate(
                     "score": product.score,
                     "evidence_tier": product.evidence_tier,
                     "evidence_label": product.evidence_label,
+                    "reference_yield_status": product.reference_yield_status,
+                    "reference_yield_reason": product.reference_yield_reason,
+                    "reference_available_horizons": list(
+                        product.reference_available_horizons
+                    ),
+                    "reference_normalized_weights": (
+                        product.reference_normalized_weights
+                    ),
+                    "yield_policy_version": product.yield_policy_version,
                     "evidence_single_cap_pct": effective_single_pct,
                     "evidence_aggregate_cap_pct": (
                         tier_caps["aggregate_pct"] if tier_caps else None
@@ -330,25 +378,15 @@ def allocate(
     unallocated_total = money(investable - allocated_total)
     if unallocated_total > 0:
         warnings.append(
-            f"共 {unallocated_total:,.0f} 元未分配到具体产品，建议留在短桶/流动性仓或补充候选产品。"
+            f"共 {unallocated_total:,.0f} 元未分配到具体产品，"
+            "建议留在短桶或补充候选产品。"
         )
-    if cash_pct == 0:
+    warnings.append(
+        "日开新增目标固定为 0%；确认应急资金在组合外，短桶承担流动性。"
+    )
+    if amount > 0 and cash_reserve / amount > 0.30:
         warnings.append(
-            "本方案不留现金/流动性仓；确认应急资金在组合外，短桶承担流动性。"
-        )
-    else:
-        warnings.append(
-            f"流动性仓 {cash_pct * 100:.1f}% 使用 R2 现金管理产品；"
-            "确认 T+0/T+1 快速赎回限额和到账规则。"
-        )
-    total_cash = money(cash_reserve + bucket_targets["cash"])
-    if cash_reserve > 0 and bucket_targets["cash"] > 0:
-        warnings.append(
-            "组合外预留现金与 R2 流动性仓同时存在；确认两者不是同一笔钱，否则会重复计算流动性。"
-        )
-    if amount > 0 and total_cash / amount > 0.30:
-        warnings.append(
-            f"组合外预留现金 + R2 流动性仓合计 {total_cash:,.0f} 元，占总资金 {total_cash / amount * 100:.1f}%；"
+            f"组合外预留现金 {cash_reserve:,.0f} 元，占总资金 {cash_reserve / amount * 100:.1f}%；"
             "确认这是流动性安排，而不是重复计算现金。"
         )
 
@@ -377,7 +415,7 @@ def allocate(
             "covered_amount": covered_amount,
             "allocated_amount": total_amount,
             "coverage_pct": money(covered_amount / total_amount * 100) if total_amount else 0,
-            "note": "加权年化来自可得周期的参考年化，不是收益承诺。",
+            "note": "组合输入年化来自期限调整参考年化，不是收益承诺。",
         }
         if weighted_yield is None:
             warnings.append("产品池未填参考年化，无法做目标检查。")
@@ -403,8 +441,8 @@ def allocate(
         "assumptions": {
             "amount": money(amount),
             "cash_reserve": money(cash_reserve),
-            "cash_pct": cash_pct,
-            "fully_invested": cash_pct == 0 and cash_reserve == 0,
+            "daily_open_target_pct": 0.0,
+            "fully_invested": cash_reserve == 0,
             "investable": investable,
             "profile": profile_name,
             "profile_weights": profile,
@@ -412,6 +450,7 @@ def allocate(
             "max_product_pct": max_product_pct,
             "evidence_caps": evidence_caps,
             "target_annualized_pct": target,
+            "yield_policy_version": POLICY_VERSION,
         },
         "bucket_targets": [
             {
@@ -447,12 +486,7 @@ def render_markdown(result: dict[str, Any]) -> str:
         f"组合外预留现金：{assumptions['cash_reserve']:,.0f} 元；"
         f"可投资：{assumptions['investable']:,.0f} 元"
     )
-    liquidity_text = (
-        "0%（全仓 R2，短桶承担流动性）"
-        if assumptions["cash_pct"] == 0
-        else f"{assumptions['cash_pct'] * 100:.1f}%（R2 现金管理）"
-    )
-    lines.append(f"- 流动性仓：{liquidity_text}")
+    lines.append("- 日开新增目标：0%（cash 产品仅展示，短桶承担流动性）")
     lines.append(
         f"- 模型：{PROFILE_LABELS.get(assumptions['profile'], assumptions['profile'])}；"
         f"单只上限 {assumptions['max_product_pct']*100:.0f}%；"
@@ -494,15 +528,16 @@ def render_markdown(result: dict[str, Any]) -> str:
     if result["allocations"]:
         lines.append("## 产品分配")
         lines.append("")
-        lines.append("| 桶 | 产品 | 发行方 | 期限 | 数据档位 | 参考年化 | 金额 | 占可投资 | 评分 |")
-        lines.append("|---|---|---|---:|---|---:|---:|---:|---:|")
+        lines.append("| 桶 | 产品 | 发行方 | 期限 | 数据档位 | 可用窗口 | 参考年化 | 金额 | 占可投资 | 评分 |")
+        lines.append("|---|---|---|---:|---|---|---:|---:|---:|---:|")
         for item in result["allocations"]:
             reference = item["annualized_yield"]
             reference_text = f"{reference:.2f}%" if reference is not None else "—"
+            horizons = " + ".join(item["reference_available_horizons"]) or "—"
             lines.append(
                 f"| {item['bucket_label']} | {item['name']} | {item['issuer']} | "
                 f"{item['term_days']:.0f}天 | {item['evidence_label']} | "
-                f"{reference_text} | "
+                f"{horizons} | {reference_text} | "
                 f"{item['amount']:,.0f} | "
                 f"{item['pct_of_investable']:.1f}% | {item['score']:.0f} |"
             )
@@ -530,7 +565,7 @@ def render_markdown(result: dict[str, Any]) -> str:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="R2 四桶配置与产品分配")
+    parser = argparse.ArgumentParser(description="R2 短/中/长期限配置与产品分配")
     parser.add_argument("--amount", type=float, required=True, help="总资金（元）")
     parser.add_argument(
         "--profile",
@@ -543,12 +578,6 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=0,
         help="组合外预留现金（元），默认 0",
-    )
-    parser.add_argument(
-        "--cash-pct",
-        type=float,
-        default=0.0,
-        help="R2 流动性仓比例（0-1），默认 0；0 表示全部资金进短/中/长 R2",
     )
     parser.add_argument(
         "--target",
@@ -612,7 +641,6 @@ def main(argv: list[str] | None = None) -> int:
             amount=args.amount,
             profile_name=args.profile,
             cash_reserve=args.cash_reserve,
-            cash_pct=args.cash_pct,
             target=args.target,
             min_unit=args.min_unit,
             max_product_pct=args.max_product_pct,

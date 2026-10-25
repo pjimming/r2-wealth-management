@@ -1,0 +1,366 @@
+{
+  "schema_version": 1,
+  "policy_version": "r2-term-yield-v1",
+  "term_boundary_cases": [
+    {
+      "term_days": null,
+      "expected_bucket": "unknown"
+    },
+    {
+      "term_days": -1,
+      "expected_bucket": "unknown"
+    },
+    {
+      "term_days": 1.5,
+      "expected_bucket": "unknown"
+    },
+    {
+      "term_days": 0,
+      "expected_bucket": "cash"
+    },
+    {
+      "term_days": 1,
+      "expected_bucket": "short"
+    },
+    {
+      "term_days": 30,
+      "expected_bucket": "short"
+    },
+    {
+      "term_days": 31,
+      "expected_bucket": "medium"
+    },
+    {
+      "term_days": 100,
+      "expected_bucket": "medium"
+    },
+    {
+      "term_days": 101,
+      "expected_bucket": "long"
+    }
+  ],
+  "reference_cases": [
+    {
+      "name": "cash complete history",
+      "product": {
+        "term_days": 0,
+        "return_1m": 2.2,
+        "return_3m": 3.3
+      },
+      "expected": {
+        "status": "available",
+        "reason": "complete_history",
+        "value_pct": 2.53,
+        "available_horizons": [
+          "1m",
+          "3m"
+        ],
+        "missing_horizons": []
+      }
+    },
+    {
+      "name": "cash zero yield",
+      "product": {
+        "term_days": 0,
+        "return_1m": 0,
+        "return_3m": 0
+      },
+      "expected": {
+        "status": "available",
+        "reason": "complete_history",
+        "value_pct": 0,
+        "available_horizons": [
+          "1m",
+          "3m"
+        ],
+        "missing_horizons": []
+      }
+    },
+    {
+      "name": "short complete history",
+      "product": {
+        "term_days": 7,
+        "return_1m": 2,
+        "return_3m": 3,
+        "return_6m": 4
+      },
+      "expected": {
+        "status": "available",
+        "reason": "complete_history",
+        "value_pct": 3.1,
+        "available_horizons": [
+          "1m",
+          "3m",
+          "6m"
+        ],
+        "missing_horizons": []
+      }
+    },
+    {
+      "name": "short missing one month",
+      "product": {
+        "term_days": 30,
+        "return_3m": 3,
+        "return_6m": 4
+      },
+      "expected": {
+        "status": "available",
+        "reason": "partial_history",
+        "value_pct": 3.375,
+        "available_horizons": [
+          "3m",
+          "6m"
+        ],
+        "missing_horizons": [
+          "1m"
+        ]
+      }
+    },
+    {
+      "name": "medium complete history",
+      "product": {
+        "term_days": 90,
+        "return_3m": 2,
+        "return_6m": 3,
+        "return_1y": 4
+      },
+      "expected": {
+        "status": "available",
+        "reason": "complete_history",
+        "value_pct": 2.7,
+        "available_horizons": [
+          "3m",
+          "6m",
+          "1y"
+        ],
+        "missing_horizons": []
+      }
+    },
+    {
+      "name": "medium missing six month",
+      "product": {
+        "term_days": 100,
+        "return_3m": 2,
+        "return_1y": 4
+      },
+      "expected": {
+        "status": "available",
+        "reason": "partial_history",
+        "value_pct": 2.5714,
+        "available_horizons": [
+          "3m",
+          "1y"
+        ],
+        "missing_horizons": [
+          "6m"
+        ]
+      }
+    },
+    {
+      "name": "long complete history",
+      "product": {
+        "term_days": 180,
+        "return_3m": 2,
+        "return_6m": 3,
+        "return_1y": 4
+      },
+      "expected": {
+        "status": "available",
+        "reason": "complete_history",
+        "value_pct": 3.2,
+        "available_horizons": [
+          "3m",
+          "6m",
+          "1y"
+        ],
+        "missing_horizons": []
+      }
+    },
+    {
+      "name": "long missing three month",
+      "product": {
+        "term_days": 101,
+        "return_6m": 3,
+        "return_1y": 4
+      },
+      "expected": {
+        "status": "available",
+        "reason": "partial_history",
+        "value_pct": 3.5,
+        "available_horizons": [
+          "6m",
+          "1y"
+        ],
+        "missing_horizons": [
+          "3m"
+        ]
+      }
+    },
+    {
+      "name": "long all designated windows missing",
+      "product": {
+        "term_days": 180,
+        "return_1m": 4
+      },
+      "expected": {
+        "status": "unavailable",
+        "reason": "no_available_horizons",
+        "value_pct": null,
+        "available_horizons": [],
+        "missing_horizons": [
+          "3m",
+          "6m",
+          "1y"
+        ]
+      }
+    },
+    {
+      "name": "unknown term",
+      "product": {
+        "term_days": 1.5,
+        "return_1m": 3,
+        "return_3m": 4,
+        "return_6m": 5,
+        "return_1y": 6
+      },
+      "expected": {
+        "status": "unavailable",
+        "reason": "unknown_term",
+        "value_pct": null,
+        "available_horizons": [],
+        "missing_horizons": []
+      }
+    }
+  ],
+  "score_cases": [
+    {
+      "name": "short divergence penalty",
+      "product": {
+        "term_days": 7,
+        "return_1m": 1.8,
+        "return_3m": 2.4,
+        "return_6m": 3,
+        "history_months": null
+      },
+      "expected": {
+        "reference_yield_pct": 2.46,
+        "observation_score": 2.38,
+        "selection_score_A": 2.38,
+        "selection_score_B": 2.38,
+        "selection_score_C": 2.38
+      }
+    },
+    {
+      "name": "medium history bonus",
+      "product": {
+        "term_days": 90,
+        "return_1m": 2.8,
+        "return_3m": 3,
+        "return_6m": 3.5,
+        "return_1y": 4.5,
+        "history_months": 18
+      },
+      "expected": {
+        "reference_yield_pct": 3.45,
+        "observation_score": 3.45,
+        "selection_score_A": 3.465,
+        "selection_score_B": 3.465,
+        "selection_score_C": 3.465
+      }
+    },
+    {
+      "name": "long A B C separation",
+      "product": {
+        "term_days": 180,
+        "return_1m": 1,
+        "return_3m": 2,
+        "return_6m": 3,
+        "return_1y": 5,
+        "history_months": 24
+      },
+      "expected": {
+        "reference_yield_pct": 3.6,
+        "observation_score": 3.52,
+        "selection_score_A": 3.4,
+        "selection_score_B": 3.475,
+        "selection_score_C": 3.55
+      }
+    },
+    {
+      "name": "cash no score",
+      "product": {
+        "term_days": 0,
+        "return_1m": 2,
+        "return_3m": 4,
+        "history_months": 24
+      },
+      "expected": {
+        "reference_yield_pct": 2.6,
+        "observation_score": null,
+        "selection_score_A": null,
+        "selection_score_B": null,
+        "selection_score_C": null
+      }
+    }
+  ],
+  "rounding_cases": [
+    {
+      "value": 1.42875,
+      "expected": 1.4288
+    },
+    {
+      "value": 3.94125,
+      "expected": 3.9413
+    },
+    {
+      "value": 3.49875,
+      "expected": 3.4988
+    },
+    {
+      "value": -1.42875,
+      "expected": -1.4288
+    },
+    {
+      "value": 0.00004,
+      "expected": 0
+    },
+    {
+      "value": -0.00004,
+      "expected": 0
+    }
+  ],
+  "front_load_gap_cases": [
+    {
+      "gap_pp": 1,
+      "expected": {
+        "A": 0,
+        "B": 0,
+        "C": 0
+      }
+    },
+    {
+      "gap_pp": 1.5,
+      "expected": {
+        "A": 0.075,
+        "B": 0,
+        "C": 0
+      }
+    },
+    {
+      "gap_pp": 2,
+      "expected": {
+        "A": 0.15,
+        "B": 0.075,
+        "C": 0
+      }
+    },
+    {
+      "gap_pp": 2.7,
+      "expected": {
+        "A": 0.25,
+        "B": 0.18,
+        "C": 0
+      }
+    }
+  ]
+}
